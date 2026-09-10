@@ -1,0 +1,11 @@
+[build]
+target = "wasm32-wasip1"
+
+[target.wasm32-wasip1]
+linker = "rust-lld"
+
+# Local builds: set these in your environment or override here.
+# CI sets them via the workflow env: block.
+# CC_wasm32_wasip1 = "/path/to/clang"
+# AR_wasm32_wasip1 = "/path/to/llvm-ar"
+# CFLAGS_wasm32_wasip1 = "--sysroot=/path/to/wasi-sysroot -include wasi_dup_stub.h"

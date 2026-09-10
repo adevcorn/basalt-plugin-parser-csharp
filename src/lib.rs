@@ -43,20 +43,21 @@ unsafe fn get_state() -> Option<&'static mut ParserState> {
             "enum" @keyword "interface" @keyword "public" @keyword "private" @keyword
             "protected" @keyword "internal" @keyword "static" @keyword "readonly" @keyword
             "sealed" @keyword "abstract" @keyword "virtual" @keyword "override" @keyword
-            "async" @keyword "await" @keyword "task" @keyword "return" @keyword
+            "async" @keyword "await" @keyword "return" @keyword
             "if" @keyword "else" @keyword "for" @keyword "foreach" @keyword "while" @keyword
             "switch" @keyword "case" @keyword "break" @keyword "continue" @keyword
-            "new" @keyword "this" @keyword "base" @keyword "null" @keyword "true" @keyword "false" @keyword
+            "new" @keyword "this" @keyword "base" @keyword (null_literal) @keyword "true" @keyword "false" @keyword
             "try" @keyword "catch" @keyword "finally" @keyword "throw" @keyword
-            "var" @keyword "int" @keyword "string" @keyword "bool" @keyword "float" @keyword "double" @keyword "void" @keyword
+            "var" @keyword
             (comment) @comment
             (string_literal) @string
             (integer_literal) @number
-            (type_identifier) @type
+            (predefined_type) @type
+            (generic_name) @type
             (method_declaration name: (identifier) @function)
             (invocation_expression (identifier) @function)
             (invocation_expression
-                expression: (member_access_expression
+                (member_access_expression
                     name: (identifier) @function))
             "+" @operator "-" @operator "*" @operator "/" @operator
             "%" @operator "=" @operator "+=" @operator "-=" @operator
@@ -64,7 +65,7 @@ unsafe fn get_state() -> Option<&'static mut ParserState> {
             "&&" @operator "||" @operator "!" @operator
             "?" @operator "??" @operator "=>" @operator
             (parameter name: (identifier) @variable)
-            (variable_declaration (variable_declarator name: (identifier) @variable))
+            (variable_declaration (variable_declarator (identifier) @variable))
         "#;
         let parse_query = Query::new(lang, parse_query_src).ok()?;
         let parse_cap_names: Vec<String> = parse_query.capture_names().iter().map(|s| s.to_string()).collect();
