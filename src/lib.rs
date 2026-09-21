@@ -1,6 +1,25 @@
 // basalt-plugin-parser-csharp/src/lib.rs — tree-sitter C# parser WASM plugin for Basalt
 
-use tree_sitter::{Language, Parser, Query, QueryCursor};
+use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
+
+// ── Retrieval-chunk v2 contract ─────────────────────────────────────────────
+//
+// Mirrors the host contract in basalt-core/src/parser.rs (and the same-named
+// constants in basalt-plugin-sdk for SDK-based plugins). v2 records are
+// 106 bytes: the v1 104-byte record plus a flags byte at offset 104 and a
+// reserved byte at 105. Flags: low 2 bits = visibility (0 unknown, 1 public,
+// 2 internal, 3 private), bit 0x04 = test-attributed symbol.
+const CHUNK_BYTES_V2: usize = 106;
+const CHUNK_FLAGS_OFF_V2: usize = 104;
+const VIS_UNKNOWN: u8 = 0;
+const VIS_PUBLIC: u8 = 1;
+const VIS_INTERNAL: u8 = 2;
+const VIS_PRIVATE: u8 = 3;
+const FLAG_TEST: u8 = 0x04;
+
+fn encode_chunk_flags(visibility: u8, is_test: bool) -> u8 {
+    (visibility & 0x03) | if is_test { FLAG_TEST } else { 0 }
+}
 
 const SRC_OFFSET: usize = 0;
 const OUT_OFFSET: usize = 6 * 1024 * 1024;
@@ -164,6 +183,143 @@ fn kind_byte(k: &str) -> u8 {
     }
 }
 
+/// Test-marker attribute names (method- and type-level, xUnit/NUnit/MSTest).
+const TEST_ATTRIBUTES: [&str; 11] = [
+    "Fact",
+    "Theory",
+    "Test",
+    "TestMethod",
+    "TestCase",
+    "TestFixture",
+    "TestClass",
+    "DataTestMethod",
+    "DataRow",
+    "SetUp",
+    "TearDown",
+];
+
+/// True when an attribute-list's text names a test attribute.
+pub fn is_test_attribute_text(text: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|tok| TEST_ATTRIBUTES.contains(&tok))
+}
+
+/// Map C# modifier keywords to a chunk visibility value.
+/// `in_interface`: interface members without modifiers are implicitly public.
+/// `is_type`: top-level types without modifiers default to internal, members
+/// to private. `protected` alone counts as public: it is API surface for
+/// derived classes. Explicit interface implementations are implicitly public.
+pub fn visibility_from_modifiers(mods: &[String], in_interface: bool, is_type: bool) -> u8 {
+    let has = |m: &str| mods.iter().any(|x| x == m);
+    if has("public") {
+        return VIS_PUBLIC;
+    }
+    if has("private") {
+        return VIS_PRIVATE;
+    }
+    if has("internal") {
+        return VIS_INTERNAL;
+    }
+    if has("protected") {
+        return VIS_PUBLIC;
+    }
+    if in_interface {
+        return VIS_PUBLIC;
+    }
+    if is_type {
+        return VIS_INTERNAL;
+    }
+    VIS_PRIVATE
+}
+
+fn has_child_kind(node: Node, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.node().kind() == kind {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Visibility of one declaration node from its `modifier` children
+/// (tree-sitter-c-sharp attaches modifiers directly, unwrapped).
+fn node_visibility(node: Node, src: &[u8], in_interface: bool, is_type: bool) -> u8 {
+    if has_child_kind(node, "explicit_interface_specifier") {
+        return VIS_PUBLIC;
+    }
+    let mut mods: Vec<String> = Vec::new();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind() == "modifier" {
+                if let Ok(t) = child.utf8_text(src) {
+                    mods.push(t.to_string());
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    visibility_from_modifiers(&mods, in_interface, is_type)
+}
+
+/// Test-ness of one declaration node from `attribute_list` children
+/// (tree-sitter-c-sharp nests them inside the declaration).
+fn node_test_attr(node: Node, src: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind() == "attribute_list" {
+                if let Ok(t) = child.utf8_text(src) {
+                    if is_test_attribute_text(t) {
+                        return true;
+                    }
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Ancestor-derived context for a declaration node: whether it sits inside an
+/// interface body (members implicitly public) and whether an enclosing type
+/// carries test attributes (members inherit test-ness).
+fn enclosing_ctx(node: Node, src: &[u8]) -> (bool, bool) {
+    let mut in_interface = false;
+    let mut enclosing_test = false;
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "interface_declaration" => {
+                in_interface = true;
+                if node_test_attr(n, src) {
+                    enclosing_test = true;
+                }
+            }
+            "class_declaration" | "struct_declaration" | "record_declaration" => {
+                if node_test_attr(n, src) {
+                    enclosing_test = true;
+                }
+            }
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    (in_interface, enclosing_test)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn basalt_retrieval_chunks(
     src_ptr: i32, src_len: i32, out_ptr: i32, max_chunks: i32,
@@ -209,6 +365,65 @@ pub unsafe extern "C" fn basalt_retrieval_chunks(
     count as i32
 }
 
+/// v2 retrieval chunks: the v1 104-byte record plus the flags byte at offset
+/// 104 (visibility low 2 bits, `FLAG_TEST`) and reserved byte at 105.
+/// Flags come from the declaration node's own modifiers/attributes plus
+/// ancestor context (interface bodies, test-attributed enclosing types).
+#[no_mangle]
+pub unsafe extern "C" fn basalt_retrieval_chunks_v2(
+    src_ptr: i32, src_len: i32, out_ptr: i32, max_chunks: i32,
+) -> i32 {
+    let src = std::slice::from_raw_parts(src_ptr as usize as *const u8, src_len as usize);
+    let out = std::slice::from_raw_parts_mut(out_ptr as usize as *mut u8, (max_chunks as usize) * CHUNK_BYTES_V2);
+    let state = match get_state() { Some(s) => s, None => return 0 };
+    state.parser.reset();
+    let Some(tree) = state.parser.parse(src, None) else { return 0 };
+    let mut cursor = QueryCursor::new();
+    let matches = cursor.matches(&state.retrieval_query, tree.root_node(), src);
+    let mut count = 0usize;
+    for m in matches {
+        if count >= max_chunks as usize { break; }
+        let mut offset = None::<u32>;
+        let mut length = None::<u32>;
+        let mut kind = None::<&str>;
+        let mut name = None::<&str>;
+        let mut decl = None::<Node>;
+        for cap in m.captures {
+            let cn = &state.retrieval_cap_names[cap.index as usize];
+            if let Some(k) = cn.strip_prefix("chunk.") {
+                offset = Some(cap.node.start_byte() as u32);
+                length = Some((cap.node.end_byte() - cap.node.start_byte()) as u32);
+                kind = Some(k);
+                decl = Some(cap.node);
+            } else if cn.starts_with("name.") {
+                if let Ok(t) = cap.node.utf8_text(src) { name = Some(t.trim()); }
+            }
+        }
+        let (Some(off), Some(len), Some(k), Some(dn)) = (offset, length, kind, decl) else { continue };
+        let label = if let Some(n) = name {
+            let mut s = k.to_string(); s.push(' '); s.push_str(n); s
+        } else { k.to_string() };
+        let is_type = matches!(k, "type" | "interface" | "module");
+        let (in_iface, enc_test) = enclosing_ctx(dn, src);
+        let flags = encode_chunk_flags(
+            node_visibility(dn, src, in_iface, is_type),
+            node_test_attr(dn, src) || enc_test,
+        );
+        let base = count * CHUNK_BYTES_V2;
+        out[base..base+4].copy_from_slice(&off.to_le_bytes());
+        out[base+4..base+8].copy_from_slice(&len.to_le_bytes());
+        let lbytes = label.as_bytes();
+        let llen = lbytes.len().min(95);
+        out[base+8..base+8+llen].copy_from_slice(&lbytes[..llen]);
+        out[base+8+llen] = 0;
+        out[base+103] = kind_byte(k);
+        out[base+CHUNK_FLAGS_OFF_V2] = flags;
+        out[base+105] = 0;
+        count += 1;
+    }
+    count as i32
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn basalt_call_sites(
     src_ptr: i32, src_len: i32, out_ptr: i32, max_sites: i32,
@@ -238,4 +453,119 @@ pub unsafe extern "C" fn basalt_call_sites(
         }
     }
     count as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn visibility_from_modifiers_cases() {
+        assert_eq!(visibility_from_modifiers(&mods(&["public"]), false, false), VIS_PUBLIC);
+        assert_eq!(
+            visibility_from_modifiers(&mods(&["public", "static"]), false, false),
+            VIS_PUBLIC
+        );
+        assert_eq!(visibility_from_modifiers(&mods(&["private"]), false, false), VIS_PRIVATE);
+        assert_eq!(visibility_from_modifiers(&mods(&["internal"]), false, false), VIS_INTERNAL);
+        assert_eq!(
+            visibility_from_modifiers(&mods(&["protected", "internal"]), false, false),
+            VIS_INTERNAL
+        );
+        // No modifiers: members default to private, types to internal,
+        // interface members are implicitly public.
+        assert_eq!(visibility_from_modifiers(&[], false, false), VIS_PRIVATE);
+        assert_eq!(visibility_from_modifiers(&[], false, true), VIS_INTERNAL);
+        assert_eq!(visibility_from_modifiers(&[], true, false), VIS_PUBLIC);
+    }
+
+    #[test]
+    fn test_attribute_text_cases() {
+        assert!(is_test_attribute_text("[Fact]"));
+        assert!(is_test_attribute_text("[Theory(DisplayName = \"x\")]"));
+        assert!(is_test_attribute_text("[TestMethod]"));
+        assert!(is_test_attribute_text("[TestCase(1, 2)]"));
+        assert!(is_test_attribute_text("[TestClass]"));
+        assert!(!is_test_attribute_text("[HttpGet]"));
+        assert!(!is_test_attribute_text("[MyFactory]"));
+        assert!(!is_test_attribute_text("[Factotum]"));
+    }
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(tree_sitter_c_sharp::language())
+            .expect("c-sharp grammar");
+        parser.parse(src, None).expect("parse ok")
+    }
+
+    fn find_method<'a>(node: Node<'a>, name: &str, src: &[u8]) -> Option<Node<'a>> {
+        if node.kind() == "method_declaration" {
+            if let Some(nn) = node.child_by_field_name("name") {
+                if nn.utf8_text(src).map_or(false, |t| t.trim() == name) {
+                    return Some(node);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                if let Some(found) = find_method(cursor.node(), name, src) {
+                    return Some(found);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    const SAMPLE: &str = r#"
+using System;
+using System.Threading.Tasks;
+
+namespace MyApp.Services;
+
+public class OrderService
+{
+    public async Task<Order> GetOrderAsync(int id) { return null; }
+    private void Log(string msg) { }
+    [Fact]
+    public void GetOrder_ReturnsOrder() { }
+}
+"#;
+
+    #[test]
+    fn node_flags_match_sample() {
+        let src = SAMPLE.as_bytes();
+        let tree = parse(SAMPLE);
+        let root = tree.root_node();
+
+        let m = find_method(root, "GetOrderAsync", src).expect("method found");
+        assert_eq!(node_visibility(m, src, false, false), VIS_PUBLIC);
+        assert!(!node_test_attr(m, src));
+
+        let m = find_method(root, "Log", src).expect("method found");
+        assert_eq!(node_visibility(m, src, false, false), VIS_PRIVATE);
+
+        let m = find_method(root, "GetOrder_ReturnsOrder", src).expect("method found");
+        assert_eq!(node_visibility(m, src, false, false), VIS_PUBLIC);
+        assert!(node_test_attr(m, src));
+    }
+
+    #[test]
+    fn enclosing_ctx_propagates_test_class() {
+        let src = b"[TestClass] public class T { public void N() { } }";
+        let tree = parse(std::str::from_utf8(src).unwrap());
+        let root = tree.root_node();
+        let m = find_method(root, "N", src).expect("method found");
+        let (in_iface, enc_test) = enclosing_ctx(m, src);
+        assert!(!in_iface);
+        assert!(enc_test);
+    }
 }
