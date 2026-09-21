@@ -91,6 +91,7 @@ unsafe fn get_state() -> Option<&'static mut ParserState> {
 
         let retrieval_query_src = r#"
             (method_declaration name: (_) @name.function) @chunk.function
+            (constructor_declaration name: (_) @name.function) @chunk.function
             (class_declaration name: (_) @name.type) @chunk.type
             (struct_declaration name: (_) @name.type) @chunk.type
             (enum_declaration name: (_) @name.type) @chunk.type
@@ -567,5 +568,42 @@ public class OrderService
         let (in_iface, enc_test) = enclosing_ctx(m, src);
         assert!(!in_iface);
         assert!(enc_test);
+    }
+
+    fn find_ctor(node: Node<'_>) -> Option<Node<'_>> {
+        if node.kind() == "constructor_declaration" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                if let Some(found) = find_ctor(cursor.node()) {
+                    return Some(found);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn constructor_capture_pattern_is_valid_and_flagged() {
+        // The exact capture added to retrieval_query_src must compile;
+        // a bad pattern would fail Query::new and disable the whole plugin.
+        let q = tree_sitter::Query::new(
+            tree_sitter_c_sharp::language(),
+            "(constructor_declaration name: (_) @name.function) @chunk.function",
+        );
+        assert!(q.is_ok(), "constructor capture pattern must be valid");
+
+        let src = "public class A { public A(int x) { } static A() { } }";
+        let tree = parse(src);
+        let pub_ctor = find_ctor(tree.root_node()).expect("ctor found");
+        assert_eq!(
+            node_visibility(pub_ctor, src.as_bytes(), false, false),
+            VIS_PUBLIC
+        );
     }
 }
