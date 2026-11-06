@@ -124,6 +124,24 @@ pub extern "C" fn basalt_lang() -> i32 {
     LANG_EXT.as_ptr() as i32
 }
 
+/// Declarative lexical profile for Layer 1 Phantom Safety Net delimiter validation.
+static LEXICAL_PROFILE: &[u8] = b"{\
+  \"version\": 1,\
+  \"extensions\": [\"cs\"],\
+  \"line_comments\": [\"//\"],\
+  \"block_comment\": [\"/*\", \"*/\"],\
+  \"strings\": [\
+    {\"open\": \"\\\"\\\"\\\"\", \"close\": \"\\\"\\\"\\\"\"},\
+    {\"open\": \"\\\"\", \"close\": \"\\\"\"},\
+    {\"open\": \"'\", \"close\": \"'\"}\
+  ]\
+}\0";
+
+#[no_mangle]
+pub extern "C" fn basalt_lexical_profile() -> i32 {
+    LEXICAL_PROFILE.as_ptr() as i32
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn basalt_src_ptr() -> i32 {
     MEMORY[SRC_OFFSET..].as_ptr() as i32
